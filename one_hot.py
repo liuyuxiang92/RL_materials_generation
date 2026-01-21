@@ -1,9 +1,16 @@
 import numpy as np
 import re
+from functools import lru_cache
+from typing import Dict, Iterable, List, Sequence, Tuple
 # from pymatgen import Composition, Element # Old version of pymatgen in syn_gen_release env
 from pymatgen.core.composition import Composition, Element # Updated for dqn env
 # import chemml.chem.magpie_python as magpie
-import chemml
+try:
+    import chemml  # type: ignore
+except ModuleNotFoundError:
+    # chemml is only needed for a legacy, commented-out featurizer implementation.
+    chemml = None
+
 import pandas as pd
 from matminer.featurizers.base import MultipleFeaturizer
 import matminer.featurizers.composition as cf
@@ -19,6 +26,22 @@ element_set = ['O', 'Te', 'N', 'B', 'Tm', 'Ga', 'Hf', 'Ca', 'Al', 'P', 'Li', 'S'
 
 comp_set  = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
 step_set  = [x for x in range(1,max_num_steps+1)]
+
+
+def _to_tuple(items: Sequence[str] | Iterable[str]) -> Tuple[str, ...]:
+    return tuple(items)
+
+
+@lru_cache(maxsize=64)
+def _build_one_hot_mappings(items: Tuple[str, ...]) -> Tuple[Dict[str, np.ndarray], Dict[Tuple[float, ...], str]]:
+    item_to_oh: Dict[str, np.ndarray] = {}
+    oh_to_item: Dict[Tuple[float, ...], str] = {}
+    for idx, item in enumerate(items):
+        enc = np.zeros(len(items))
+        enc[idx] = 1.0
+        item_to_oh[item] = enc
+        oh_to_item[tuple(enc.tolist())] = item
+    return item_to_oh, oh_to_item
 
 def _get_target_char_sequence(compound_string):
     comp = Composition(compound_string).formula.replace(" ", "")
@@ -162,11 +185,20 @@ def element_to_one_hot(elements):
     '''
 
     """
-    element_to_one_hot = []
+def element_to_one_hot(elements: Sequence[str], element_set_override: Sequence[str] | None = None):
+    """Convert element symbol(s) to one-hot.
+
+    Backward compatible: if element_set_override is None, uses global element_set.
+    """
+    if element_set_override is None:
+        mapping = element_to_one_hot_dict
+    else:
+        mapping, _ = _build_one_hot_mappings(_to_tuple(element_set_override))
+
+    out: List[np.ndarray] = []
     for element in elements:
-        enc = element_to_one_hot_dict[element]
-        element_to_one_hot.append(enc)
-    return element_to_one_hot
+        out.append(mapping[element])
+    return out
 
 def one_hot_to_element(one_hot_encs):
     """
@@ -181,11 +213,20 @@ def one_hot_to_element(one_hot_encs):
     Returns:
     one_hot_to_element: List of elements in string form
     """
-    one_hot_to_element = []
+def one_hot_to_element(one_hot_encs: Sequence[Sequence[float] | Tuple[float, ...]], element_set_override: Sequence[str] | None = None):
+    """Convert one-hot vector(s) back to element symbols.
+
+    Backward compatible: if element_set_override is None, uses global element_set.
+    """
+    if element_set_override is None:
+        inverse = one_hot_to_element_dict
+    else:
+        _, inverse = _build_one_hot_mappings(_to_tuple(element_set_override))
+
+    out: List[str] = []
     for enc in one_hot_encs:
-        element = one_hot_to_element_dict[enc]
-        one_hot_to_element.append(element)
-    return one_hot_to_element
+        out.append(inverse[tuple(enc)])
+    return out
 
 ########
 # Find step to one-hot dictionary
@@ -213,11 +254,22 @@ def step_to_one_hot(steps):
     '''
 
     """
-    step_to_one_hot = []
+def step_to_one_hot(steps: Sequence[int], step_set_override: Sequence[int] | None = None):
+    """Convert step(s) to one-hot.
+
+    Backward compatible: if step_set_override is None, uses global step_set.
+    """
+    if step_set_override is None:
+        mapping = step_to_one_hot_dict
+    else:
+        items = tuple(str(x) for x in step_set_override)
+        mapping_str, _ = _build_one_hot_mappings(items)
+        mapping = {int(k): v for k, v in mapping_str.items()}
+
+    out: List[np.ndarray] = []
     for step in steps:
-        enc = step_to_one_hot_dict[step]
-        step_to_one_hot.append(enc)
-    return step_to_one_hot
+        out.append(mapping[step])
+    return out
 
 def one_hot_to_step(one_hot_encs):
     """
@@ -232,11 +284,19 @@ def one_hot_to_step(one_hot_encs):
     Returns:
     one_hot_to_step: List of steps in string form
     """
-    one_hot_to_step = []
+def one_hot_to_step(one_hot_encs: Sequence[Sequence[float] | Tuple[float, ...]], step_set_override: Sequence[int] | None = None):
+    """Convert one-hot vector(s) back to step index."""
+    if step_set_override is None:
+        inverse = one_hot_to_step_dict
+    else:
+        items = tuple(str(x) for x in step_set_override)
+        _, inverse_str = _build_one_hot_mappings(items)
+        inverse = {k: int(v) for k, v in inverse_str.items()}
+
+    out: List[int] = []
     for enc in one_hot_encs:
-        step = one_hot_to_step_dict[enc]
-        one_hot_to_step.append(step)
-    return one_hot_to_step
+        out.append(inverse[tuple(enc)])
+    return out
 
 
 
@@ -267,11 +327,20 @@ def comp_to_one_hot(comps):
     '''
 
     """
-    comp_to_one_hot = []
+def comp_to_one_hot(comps: Sequence[str], comp_set_override: Sequence[str] | None = None):
+    """Convert composition token(s) to one-hot.
+
+    Backward compatible: if comp_set_override is None, uses global comp_set.
+    """
+    if comp_set_override is None:
+        mapping = comp_to_one_hot_dict
+    else:
+        mapping, _ = _build_one_hot_mappings(_to_tuple(comp_set_override))
+
+    out: List[np.ndarray] = []
     for comp in comps:
-        enc = comp_to_one_hot_dict[comp]
-        comp_to_one_hot.append(enc)
-    return comp_to_one_hot
+        out.append(mapping[comp])
+    return out
 
 def one_hot_to_comp(one_hot_encs):
     """
@@ -286,11 +355,17 @@ def one_hot_to_comp(one_hot_encs):
     Returns:
     one_hot_to_comp: List of compositions in string form
     """
-    one_hot_to_comp = []
+def one_hot_to_comp(one_hot_encs: Sequence[Sequence[float] | Tuple[float, ...]], comp_set_override: Sequence[str] | None = None):
+    """Convert one-hot vector(s) back to composition tokens."""
+    if comp_set_override is None:
+        inverse = one_hot_to_comp_dict
+    else:
+        _, inverse = _build_one_hot_mappings(_to_tuple(comp_set_override))
+
+    out: List[str] = []
     for enc in one_hot_encs:
-        comp = one_hot_to_comp_dict[enc]
-        one_hot_to_comp.append(comp)
-    return one_hot_to_comp
+        out.append(inverse[tuple(enc)])
+    return out
 
 # ======= Testing functions =======
 # print(element_to_one_hot(['Te', 'C', 'Ru']))
