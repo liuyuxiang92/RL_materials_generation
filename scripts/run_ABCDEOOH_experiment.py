@@ -224,6 +224,7 @@ def main() -> None:
         rf_model = joblib.load(args.rf_model)
 
     dp_predictor = None
+    # Cache DP evaluations: key -> {"mean": float, "std": float, "objective": float}
     dp_cache = {}
     if args.reward_mode == "dp":
         from dp_predictor import DPConfig, DeepMDOverpotentialPredictor, objective_from_mean_std
@@ -271,16 +272,32 @@ def main() -> None:
             comp = env.terminal_cation_fractions()
             key = tuple(sorted((k, float(v)) for k, v in comp.items()))
             if key in dp_cache:
-                mean, std = dp_cache[key]
+                entry = dp_cache[key]
+                mean = entry["mean"]
+                std = entry["std"]
             else:
                 mean, std, _ = dp_predictor.predict_overpotential(
                     comp,
                     uncertainty=args.dp_uncertainty,
                     return_per_model=False,
                 )
-                dp_cache[key] = (mean, std)
+                obj = objective_from_mean_std(mean, std, mode=args.dp_objective, k=args.dp_k)
+                dp_cache[key] = {"mean": mean, "std": std, "objective": obj}
 
-            obj = objective_from_mean_std(mean, std, mode=args.dp_objective, k=args.dp_k)
+            # If cache was hit, objective might not yet be stored (older runs); ensure it is.
+            if "objective" not in dp_cache[key]:
+                obj = objective_from_mean_std(mean, std, mode=args.dp_objective, k=args.dp_k)
+                dp_cache[key]["objective"] = obj
+            else:
+                obj = dp_cache[key]["objective"]
+
+            # Log raw DP outputs for debugging.
+            print(
+                f"[DP-Reward] comp={comp} mean={mean:.6f} std={std:.6f} "
+                f"objective={obj:.6f} reward={-obj:.6f}",
+                flush=True,
+            )
+
             # RL maximizes reward; we want to minimize objective.
             return -float(obj)
 
@@ -360,10 +377,31 @@ def main() -> None:
 
         formula = env.terminal_formula
         reward = float(env.path[-1].reward)
-        rows.append({"formula": formula, "reward": reward})
+
+        dp_mean = ""
+        dp_std = ""
+        if args.reward_mode == "dp":
+            assert dp_predictor is not None
+            comp = env.terminal_cation_fractions()
+            key = tuple(sorted((k, float(v)) for k, v in comp.items()))
+            entry = dp_cache.get(key)
+            if entry is None:
+                # If this composition was not seen during random episodes, evaluate now.
+                mean, std, _ = dp_predictor.predict_overpotential(
+                    comp,
+                    uncertainty=args.dp_uncertainty,
+                    return_per_model=False,
+                )
+                obj = objective_from_mean_std(mean, std, mode=args.dp_objective, k=args.dp_k)
+                entry = {"mean": mean, "std": std, "objective": obj}
+                dp_cache[key] = entry
+            dp_mean = float(entry["mean"])
+            dp_std = float(entry["std"])
+
+        rows.append({"formula": formula, "reward": reward, "dp_mean": dp_mean, "dp_std": dp_std})
 
     with open(os.path.join(args.out, "generated.csv"), "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["formula", "reward"])
+        w = csv.DictWriter(f, fieldnames=["formula", "reward", "dp_mean", "dp_std"])
         w.writeheader()
         w.writerows(rows)
 
