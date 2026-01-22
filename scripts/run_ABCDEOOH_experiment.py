@@ -380,6 +380,7 @@ def main() -> None:
 
         dp_mean = ""
         dp_std = ""
+        dp_mean_minus_std = ""
         if args.reward_mode == "dp":
             assert dp_predictor is not None
             comp = env.terminal_cation_fractions()
@@ -397,11 +398,27 @@ def main() -> None:
                 dp_cache[key] = entry
             dp_mean = float(entry["mean"])
             dp_std = float(entry["std"])
+            dp_mean_minus_std = float(dp_mean) - float(dp_std)
 
-        rows.append({"formula": formula, "reward": reward, "dp_mean": dp_mean, "dp_std": dp_std})
+        rows.append(
+            {
+                "formula": formula,
+                "reward": reward,
+                "dp_mean": dp_mean,
+                "dp_std": dp_std,
+                "dp_mean_minus_std": dp_mean_minus_std,
+            }
+        )
+
+    # For DP reward mode, sort candidates by increasing dp_mean - dp_std (best first).
+    if args.reward_mode == "dp":
+        rows.sort(key=lambda r: r["dp_mean_minus_std"])
 
     with open(os.path.join(args.out, "generated.csv"), "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["formula", "reward", "dp_mean", "dp_std"])
+        w = csv.DictWriter(
+            f,
+            fieldnames=["formula", "reward", "dp_mean", "dp_std", "dp_mean_minus_std"],
+        )
         w.writeheader()
         w.writerows(rows)
 
