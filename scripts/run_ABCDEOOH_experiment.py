@@ -173,6 +173,15 @@ def main() -> None:
     parser.add_argument("--anion-formula", type=str, default="O2H1")
 
     parser.add_argument(
+        "--use-saved-random-dataset",
+        action="store_true",
+        help=(
+            "If set, load offline random dataset from 'random_dataset.npz' in --out "
+            "and skip regenerating random episodes (no DeepMD/RF calls for data gen)."
+        ),
+    )
+
+    parser.add_argument(
         "--reward-mode",
         choices=["none", "sinter-rf", "dp"],
         default="none",
@@ -303,25 +312,49 @@ def main() -> None:
 
         env.reward_fn = dp_reward_fn
 
-    # 1) Generate random episodes under constraint mask
-    all_inputs = []
-    all_q = []
+    # 1) Build or load offline random dataset for DQN training.
+    if args.use_saved_random_dataset:
+        ds_path = os.path.join(args.out, "random_dataset.npz")
+        if not os.path.exists(ds_path):
+            raise SystemExit(
+                f"--use-saved-random-dataset was set but '{ds_path}' does not exist. "
+                "Run once without this flag to generate it."
+            )
+        data = np.load(ds_path)
+        s_mat = data["s_mat"]
+        s_step = data["s_step"]
+        a_elem = data["a_elem"]
+        a_comp = data["a_comp"]
+        y = data["y"]
+    else:
+        all_inputs = []
+        all_q = []
 
-    for _ in tqdm(range(args.num_random_eps), desc="Random episodes"):
-        env.initialize()
-        for _step in range(env.max_steps):
-            env.step(env.sample_random_action())
-        episode = env.path
-        inputs, q_targets = extract_mc_q_targets(episode, args.gamma)
-        all_inputs.extend(inputs)
-        all_q.extend(q_targets)
+        for _ in tqdm(range(args.num_random_eps), desc="Random episodes"):
+            env.initialize()
+            for _step in range(env.max_steps):
+                env.step(env.sample_random_action())
+            episode = env.path
+            inputs, q_targets = extract_mc_q_targets(episode, args.gamma)
+            all_inputs.extend(inputs)
+            all_q.extend(q_targets)
 
-    # 2) Scale material features (same pattern as oxides scripts)
-    s_mat = np.stack([x[0] for x in all_inputs], axis=0)
-    s_step = np.stack([x[1] for x in all_inputs], axis=0)
-    a_elem = np.stack([x[2] for x in all_inputs], axis=0)
-    a_comp = np.stack([x[3] for x in all_inputs], axis=0)
-    y = np.asarray(all_q, dtype=float).reshape(-1, 1)
+        # Build arrays from collected inputs/targets.
+        s_mat = np.stack([x[0] for x in all_inputs], axis=0)
+        s_step = np.stack([x[1] for x in all_inputs], axis=0)
+        a_elem = np.stack([x[2] for x in all_inputs], axis=0)
+        a_comp = np.stack([x[3] for x in all_inputs], axis=0)
+        y = np.asarray(all_q, dtype=float).reshape(-1, 1)
+
+        # Save offline dataset so future runs can skip random episode generation / DP calls.
+        np.savez(
+            os.path.join(args.out, "random_dataset.npz"),
+            s_mat=s_mat,
+            s_step=s_step,
+            a_elem=a_elem,
+            a_comp=a_comp,
+            y=y,
+        )
 
     scaler = StandardScaler()
     s_mat_scaled = scaler.fit_transform(s_mat)
