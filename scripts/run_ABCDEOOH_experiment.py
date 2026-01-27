@@ -43,6 +43,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from env_oxyhydroxide import ABCDEOOHEnv, DEFAULT_CATION_SET, DEFAULT_FRACTIONS
+from constraints.primary_phase import check_primary_phase
 from model import DQN_pytorch
 from one_hot import feature_calculators, featurize_target, step_to_one_hot
 
@@ -178,6 +179,17 @@ def main() -> None:
         help=(
             "If set, load offline random dataset from 'random_dataset.npz' in --out "
             "and skip regenerating random episodes (no DeepMD/RF calls for data gen)."
+        ),
+    )
+
+    parser.add_argument(
+        "--primary-phase-filter",
+        choices=["none", "buffer", "generated", "both"],
+        default="none",
+        help=(
+            "Apply Ni/NiFe/NiFeCo/CoFe primary-phase constraints either when building "
+            "the offline buffer ('buffer'), when writing generated.csv ('generated'), "
+            "both, or not at all ('none')."
         ),
     )
 
@@ -330,14 +342,30 @@ def main() -> None:
         all_inputs = []
         all_q = []
 
+        accepted_eps = 0
         for _ in tqdm(range(args.num_random_eps), desc="Random episodes"):
             env.initialize()
             for _step in range(env.max_steps):
                 env.step(env.sample_random_action())
+
+            # Optional primary-phase filter for buffer construction.
+            if args.primary_phase_filter in {"buffer", "both"}:
+                comp = env.terminal_cation_fractions()
+                ok, _label = check_primary_phase(comp)
+                if not ok:
+                    continue
+
             episode = env.path
             inputs, q_targets = extract_mc_q_targets(episode, args.gamma)
             all_inputs.extend(inputs)
             all_q.extend(q_targets)
+            accepted_eps += 1
+
+        if accepted_eps == 0:
+            raise SystemExit(
+                "Primary-phase filter rejected all random episodes; "
+                "relax constraints or regenerate with different seed/params."
+            )
 
         # Build arrays from collected inputs/targets.
         s_mat = np.stack([x[0] for x in all_inputs], axis=0)
@@ -414,6 +442,8 @@ def main() -> None:
         dp_mean = ""
         dp_std = ""
         dp_mean_minus_std = ""
+        primary_ok = ""
+        primary_label = ""
         if args.reward_mode == "dp":
             assert dp_predictor is not None
             comp = env.terminal_cation_fractions()
@@ -433,6 +463,12 @@ def main() -> None:
             dp_std = float(entry["std"])
             dp_mean_minus_std = float(dp_mean) - float(dp_std)
 
+        if args.primary_phase_filter in {"generated", "both"}:
+            comp = env.terminal_cation_fractions()
+            ok, label = check_primary_phase(comp)
+            primary_ok = bool(ok)
+            primary_label = label or ""
+
         rows.append(
             {
                 "formula": formula,
@@ -440,6 +476,8 @@ def main() -> None:
                 "dp_mean": dp_mean,
                 "dp_std": dp_std,
                 "dp_mean_minus_std": dp_mean_minus_std,
+                "primary_ok": primary_ok,
+                "primary_label": primary_label,
             }
         )
 
@@ -450,7 +488,15 @@ def main() -> None:
     with open(os.path.join(args.out, "generated.csv"), "w", newline="") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["formula", "reward", "dp_mean", "dp_std", "dp_mean_minus_std"],
+            fieldnames=[
+                "formula",
+                "reward",
+                "dp_mean",
+                "dp_std",
+                "dp_mean_minus_std",
+                "primary_ok",
+                "primary_label",
+            ],
         )
         w.writeheader()
         w.writerows(rows)

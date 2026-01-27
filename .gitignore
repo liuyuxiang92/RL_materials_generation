@@ -19,3 +19,5 @@ rf_models/optimal_calcine_RF.joblib
 *.out
 envs
 .ipynb_checkpoints/
+.venv/
+runs/

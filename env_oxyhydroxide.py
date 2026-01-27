@@ -49,7 +49,26 @@ DEFAULT_CATION_SET: List[str] = [
 ]
 
 # Discrete fractions required by the user.
-DEFAULT_FRACTIONS: List[str] = ["0.05", "0.10", "0.15", "0.20", "0.25", "0.30", "0.35"]
+# Extended grid: 0.05, 0.10, ..., 0.80 (step size 0.05),
+# with 5 distinct cations whose fractions sum to 1.0.
+DEFAULT_FRACTIONS: List[str] = [
+    "0.05",
+    "0.10",
+    "0.15",
+    "0.20",
+    "0.25",
+    "0.30",
+    "0.35",
+    "0.40",
+    "0.45",
+    "0.50",
+    "0.55",
+    "0.60",
+    "0.65",
+    "0.70",
+    "0.75",
+    "0.80",
+]
 
 
 def _format_fraction(units: int) -> str:
