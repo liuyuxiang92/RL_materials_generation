@@ -291,6 +291,18 @@ def main() -> None:
 
         def dp_reward_fn(_terminal_formula: str) -> float:
             comp = env.terminal_cation_fractions()
+
+            # If this episode will be filtered out of the replay buffer anyway,
+            # skip expensive DeepMD evaluation entirely.
+            if args.primary_phase_filter in {"buffer", "both"}:
+                ok, label = check_primary_phase(comp)
+                if not ok:
+                    print(
+                        f"[DP-Reward] skipped (primary-phase={label or 'none'}) comp={comp}",
+                        flush=True,
+                    )
+                    return 0.0
+
             key = tuple(sorted((k, float(v)) for k, v in comp.items()))
             if key in dp_cache:
                 entry = dp_cache[key]
@@ -439,35 +451,45 @@ def main() -> None:
         formula = env.terminal_formula
         reward = float(env.path[-1].reward)
 
+        comp = None
+        if args.reward_mode == "dp" or args.primary_phase_filter in {"generated", "both"}:
+            comp = env.terminal_cation_fractions()
+
         dp_mean = ""
         dp_std = ""
         dp_mean_minus_std = ""
         primary_ok = ""
         primary_label = ""
-        if args.reward_mode == "dp":
-            assert dp_predictor is not None
-            comp = env.terminal_cation_fractions()
-            key = tuple(sorted((k, float(v)) for k, v in comp.items()))
-            entry = dp_cache.get(key)
-            if entry is None:
-                # If this composition was not seen during random episodes, evaluate now.
-                mean, std, _ = dp_predictor.predict_overpotential(
-                    comp,
-                    uncertainty=args.dp_uncertainty,
-                    return_per_model=False,
-                )
-                obj = objective_from_mean_std(mean, std, mode=args.dp_objective, k=args.dp_k)
-                entry = {"mean": mean, "std": std, "objective": obj}
-                dp_cache[key] = entry
-            dp_mean = float(entry["mean"])
-            dp_std = float(entry["std"])
-            dp_mean_minus_std = float(dp_mean) - float(dp_std)
 
         if args.primary_phase_filter in {"generated", "both"}:
-            comp = env.terminal_cation_fractions()
+            assert comp is not None
             ok, label = check_primary_phase(comp)
             primary_ok = bool(ok)
             primary_label = label or ""
+
+        if args.reward_mode == "dp":
+            assert dp_predictor is not None
+            assert comp is not None
+
+            # When tagging/filtering generated outputs, skip DeepMD evaluation for invalid comps.
+            if args.primary_phase_filter in {"generated", "both"} and primary_ok is False:
+                dp_mean_minus_std = float("inf")
+            else:
+                key = tuple(sorted((k, float(v)) for k, v in comp.items()))
+                entry = dp_cache.get(key)
+                if entry is None:
+                    # If this composition was not seen during random episodes, evaluate now.
+                    mean, std, _ = dp_predictor.predict_overpotential(
+                        comp,
+                        uncertainty=args.dp_uncertainty,
+                        return_per_model=False,
+                    )
+                    obj = objective_from_mean_std(mean, std, mode=args.dp_objective, k=args.dp_k)
+                    entry = {"mean": mean, "std": std, "objective": obj}
+                    dp_cache[key] = entry
+                dp_mean = float(entry["mean"])
+                dp_std = float(entry["std"])
+                dp_mean_minus_std = float(dp_mean) - float(dp_std)
 
         rows.append(
             {
