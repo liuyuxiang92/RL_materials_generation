@@ -161,14 +161,49 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--seed", type=int, default=0)
 
-    parser.add_argument("--num-random-eps", type=int, default=5000)
+    parser.add_argument(
+        "--num-random-eps",
+        type=int,
+        default=5000,
+        help=(
+            "Number of random episodes used to build the offline training dataset. "
+            "If --primary-phase-filter is 'buffer' or 'both', this is the number of ACCEPTED "
+            "(constraint-valid) episodes to collect."
+        ),
+    )
+    parser.add_argument(
+        "--max-random-attempts",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of random episode attempts to reach --num-random-eps accepted episodes "
+            "when buffer filtering is enabled. If unset, defaults to num_random_eps*200."
+        ),
+    )
     parser.add_argument("--gamma", type=float, default=0.9)
 
     parser.add_argument("--dqn-epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
 
-    parser.add_argument("--num-gen-eps", type=int, default=500)
+    parser.add_argument(
+        "--num-gen-eps",
+        type=int,
+        default=500,
+        help=(
+            "Number of generated episodes (candidates). If --primary-phase-filter is 'generated' or 'both', "
+            "this is the number of ACCEPTED (constraint-valid) candidates to write to generated.csv."
+        ),
+    )
+    parser.add_argument(
+        "--max-gen-attempts",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of generation attempts to reach --num-gen-eps accepted candidates when generated "
+            "filtering is enabled. If unset, defaults to num_gen_eps*200."
+        ),
+    )
     parser.add_argument("--stochastic-top-frac", type=float, default=0.0)
 
     parser.add_argument("--anion-formula", type=str, default="O2H1")
@@ -285,6 +320,10 @@ def main() -> None:
         reward_fn=reward_fn,
     )
 
+    # Used by dp_reward_fn to avoid wasting DeepMD on episodes we will discard.
+    # Values: "random" | "generate".
+    current_phase = "random"
+
     if args.reward_mode == "dp":
         assert dp_predictor is not None
         from dp_predictor import objective_from_mean_std
@@ -294,7 +333,13 @@ def main() -> None:
 
             # If this episode will be filtered out of the replay buffer anyway,
             # skip expensive DeepMD evaluation entirely.
+            skip_for_constraints = False
             if args.primary_phase_filter in {"buffer", "both"}:
+                skip_for_constraints = True
+            elif current_phase == "generate" and args.primary_phase_filter in {"generated", "both"}:
+                skip_for_constraints = True
+
+            if skip_for_constraints:
                 ok, label = check_primary_phase(comp)
                 if not ok:
                     print(
@@ -354,14 +399,25 @@ def main() -> None:
         all_inputs = []
         all_q = []
 
+        need_buffer_filter = args.primary_phase_filter in {"buffer", "both"}
+        target_eps = int(args.num_random_eps)
+        max_attempts = (
+            int(args.max_random_attempts)
+            if args.max_random_attempts is not None
+            else (target_eps * 200 if need_buffer_filter else target_eps)
+        )
+
         accepted_eps = 0
-        for _ in tqdm(range(args.num_random_eps), desc="Random episodes"):
+        attempts = 0
+        pbar = tqdm(total=target_eps, desc="Random episodes (accepted)")
+        while accepted_eps < target_eps and attempts < max_attempts:
+            attempts += 1
             env.initialize()
             for _step in range(env.max_steps):
                 env.step(env.sample_random_action())
 
             # Optional primary-phase filter for buffer construction.
-            if args.primary_phase_filter in {"buffer", "both"}:
+            if need_buffer_filter:
                 comp = env.terminal_cation_fractions()
                 ok, _label = check_primary_phase(comp)
                 if not ok:
@@ -372,11 +428,23 @@ def main() -> None:
             all_inputs.extend(inputs)
             all_q.extend(q_targets)
             accepted_eps += 1
+            pbar.update(1)
 
-        if accepted_eps == 0:
+        pbar.close()
+
+        if accepted_eps < target_eps:
             raise SystemExit(
-                "Primary-phase filter rejected all random episodes; "
-                "relax constraints or regenerate with different seed/params."
+                "Could not collect enough constraint-valid random episodes. "
+                f"Accepted {accepted_eps}/{target_eps} after {attempts} attempts. "
+                "Increase --max-random-attempts and/or relax constraints."
+            )
+
+        if need_buffer_filter:
+            print(
+                f"[Buffer] Accepted {accepted_eps}/{attempts} episodes "
+                f"(acceptance={accepted_eps / max(1, attempts):.4f}); "
+                f"training rows={len(all_inputs)} (~{len(all_inputs) / accepted_eps:.1f} per ep)",
+                flush=True,
             )
 
         # Build arrays from collected inputs/targets.
@@ -428,7 +496,21 @@ def main() -> None:
     # 4) Generate new candidates using DQN policy
     dqn.eval()
     rows = []
-    for _ in tqdm(range(args.num_gen_eps), desc="Generate"):
+
+    need_generated_filter = args.primary_phase_filter in {"generated", "both"}
+    target_gen = int(args.num_gen_eps)
+    max_gen_attempts = (
+        int(args.max_gen_attempts)
+        if args.max_gen_attempts is not None
+        else (target_gen * 200 if need_generated_filter else target_gen)
+    )
+
+    current_phase = "generate"
+    accepted_gen = 0
+    gen_attempts = 0
+    pbar = tqdm(total=target_gen, desc="Generate (accepted)")
+    while accepted_gen < target_gen and gen_attempts < max_gen_attempts:
+        gen_attempts += 1
         env.initialize()
         for _step in range(env.max_steps):
             # State for decision is features of *current* state string.
@@ -448,48 +530,37 @@ def main() -> None:
             )
             env.step(action)
 
+        comp = env.terminal_cation_fractions()
+        ok, label = check_primary_phase(comp)
+        if need_generated_filter and not ok:
+            continue
+
         formula = env.terminal_formula
         reward = float(env.path[-1].reward)
-
-        comp = None
-        if args.reward_mode == "dp" or args.primary_phase_filter in {"generated", "both"}:
-            comp = env.terminal_cation_fractions()
 
         dp_mean = ""
         dp_std = ""
         dp_mean_minus_std = ""
-        primary_ok = ""
-        primary_label = ""
-
-        if args.primary_phase_filter in {"generated", "both"}:
-            assert comp is not None
-            ok, label = check_primary_phase(comp)
-            primary_ok = bool(ok)
-            primary_label = label or ""
+        primary_ok = bool(ok)
+        primary_label = label or ""
 
         if args.reward_mode == "dp":
             assert dp_predictor is not None
-            assert comp is not None
-
-            # When tagging/filtering generated outputs, skip DeepMD evaluation for invalid comps.
-            if args.primary_phase_filter in {"generated", "both"} and primary_ok is False:
-                dp_mean_minus_std = float("inf")
-            else:
-                key = tuple(sorted((k, float(v)) for k, v in comp.items()))
-                entry = dp_cache.get(key)
-                if entry is None:
-                    # If this composition was not seen during random episodes, evaluate now.
-                    mean, std, _ = dp_predictor.predict_overpotential(
-                        comp,
-                        uncertainty=args.dp_uncertainty,
-                        return_per_model=False,
-                    )
-                    obj = objective_from_mean_std(mean, std, mode=args.dp_objective, k=args.dp_k)
-                    entry = {"mean": mean, "std": std, "objective": obj}
-                    dp_cache[key] = entry
-                dp_mean = float(entry["mean"])
-                dp_std = float(entry["std"])
-                dp_mean_minus_std = float(dp_mean) - float(dp_std)
+            key = tuple(sorted((k, float(v)) for k, v in comp.items()))
+            entry = dp_cache.get(key)
+            if entry is None:
+                # If this composition was not seen during random episodes, evaluate now.
+                mean, std, _ = dp_predictor.predict_overpotential(
+                    comp,
+                    uncertainty=args.dp_uncertainty,
+                    return_per_model=False,
+                )
+                obj = objective_from_mean_std(mean, std, mode=args.dp_objective, k=args.dp_k)
+                entry = {"mean": mean, "std": std, "objective": obj}
+                dp_cache[key] = entry
+            dp_mean = float(entry["mean"])
+            dp_std = float(entry["std"])
+            dp_mean_minus_std = float(dp_mean) - float(dp_std)
 
         rows.append(
             {
@@ -501,6 +572,23 @@ def main() -> None:
                 "primary_ok": primary_ok,
                 "primary_label": primary_label,
             }
+        )
+        accepted_gen += 1
+        pbar.update(1)
+
+    pbar.close()
+    if accepted_gen < target_gen:
+        raise SystemExit(
+            "Could not generate enough constraint-valid candidates. "
+            f"Accepted {accepted_gen}/{target_gen} after {gen_attempts} attempts. "
+            "Increase --max-gen-attempts and/or relax constraints."
+        )
+
+    if need_generated_filter:
+        print(
+            f"[Generate] Accepted {accepted_gen}/{gen_attempts} candidates "
+            f"(acceptance={accepted_gen / max(1, gen_attempts):.4f})",
+            flush=True,
         )
 
     # For DP reward mode, sort candidates by increasing dp_mean - dp_std (best first).
