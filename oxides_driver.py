@@ -25,36 +25,53 @@ import matminer.featurizers.composition as cf
 from sklearn.ensemble import RandomForestRegressor
 import joblib
 from roost_models.roost_model import predict_formation_energy, predict_bulk_mod, predict_shear_mod, predict_band_gap
-os.environ["CUDA_VISIBLE_DEVICES"]="2"
-print(torch.cuda.is_available())
+import argparse
+import env_constrained  # module handle, used to sync the random-init env objective below
+
+parser = argparse.ArgumentParser(
+    description='DQN training for inverse oxide design (sinter / calcine reproduction)')
+parser.add_argument('--tasks', nargs='+', default=['sinter'],
+                    choices=['sinter', 'calcine', 'form_e', 'bulk_mod', 'shear_mod', 'band_gap'],
+                    help='Reward objective(s). Examples: '
+                         '"--tasks sinter", "--tasks calcine", "--tasks sinter calcine"')
+parser.add_argument('--run-id', type=int, default=1,
+                    help='Run/seed id; sets the output-folder suffix, e.g. -1, -2, -3')
+parser.add_argument('--gpu', type=str, default=None,
+                    help='CUDA_VISIBLE_DEVICES GPU index. If omitted, the shell env var is used.')
+args = parser.parse_args()
+
+if args.gpu is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+print('CUDA available:', torch.cuda.is_available())
 
 configs = {
           'mat_class': 'oxides',
-          'tasks': [
-                    # 'sinter', 
-                    'calcine',
-                    # 'form_e',
-                    # 'bulk_mod',
-                    # 'shear_mod',
-                    # 'band_gap'
-                    ],
+          'tasks': args.tasks,
             }
 
 mat_class = configs['mat_class']
 tasks     = configs['tasks']
 
+RUN_ID = args.run_id
+
+# The random-init phase uses generate_random_ep(), which acts on the module-level
+# env in env_constrained (built from configs.py). Sync its objective to --tasks so
+# the seed episodes optimize the same reward as the main training loop.
+env_constrained.env.tasks = tasks
+
+print('==> tasks={}, run_id={}, output suffix=-{}'.format(tasks, RUN_ID, RUN_ID))
+
 folder_name = mat_class
 for task in tasks:
     folder_name += '_{}'.format(task)
-folder_name += '-3'
+folder_name += '-{}'.format(RUN_ID)
 env = ConstrainedMaterialEnvironment(element_set = element_set,
                           comp_set =  comp_set,
                           tasks = tasks
                           )
 relevant_folders = ['data', 'dcn_models', 'dqn_models', 'plots', 'training_data']
 for folder in relevant_folders:
-    if os.path.isdir(folder + '/{}'.format(folder_name)) == False:
-        os.mkdir(folder + '/{}'.format(folder_name))
+    os.makedirs(folder + '/{}'.format(folder_name), exist_ok=True)
 
 # ========= FOR RANDOM POLICY ===========
 start = time.time()
@@ -874,6 +891,18 @@ for iteration in tqdm(range(num_iter)):
 #         torch.save(dcn, './dcn_models/constrained_DQN_cuda/dcn_%.0fiter_roost_constrained' % iteration)
 
     epsilon *= 0.99 # Decay epsilon
+
+# Post-training: generate 1000 candidates with the fully-trained DQN (epsilon=0)
+print('\n========== POST-TRAINING EVALUATION (1000 candidates) ==========')
+_, _, final_rewards_1000, final_compounds_1000 = \
+    generate_Q_c_datapoints_and_evaluate_policy(
+        dqn=dqn, dcn=dcn, num_eps=1000, epsilon=0,
+        en_threshold=en_threshold, stochastic_top_frac=0.20, oxide=True)
+print('Compounds generated (1000-ep eval):', len(final_compounds_1000))
+
+with open('./training_data/{}/final_1000_compounds_roost_constrained.pkl'.format(folder_name), 'wb') as f:
+    pickle.dump({'compounds': final_compounds_1000,
+                 'rewards':   final_rewards_1000}, f, pickle.HIGHEST_PROTOCOL)
 
 with open('./training_data/{}/final_rewards_vs_iter_roost_constrained.pkl'.format(folder_name), 'wb') as f:
         pickle.dump(final_rewards_vs_iter, f, pickle.HIGHEST_PROTOCOL)
